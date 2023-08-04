@@ -27,8 +27,11 @@ package matching
 import (
 	"time"
 
+	"go.temporal.io/server/common"
+	"go.temporal.io/server/common/backoff"
 	"go.temporal.io/server/common/dynamicconfig"
 	"go.temporal.io/server/common/namespace"
+	"go.temporal.io/server/common/persistence/visibility"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/util"
 )
@@ -41,9 +44,11 @@ type (
 		PersistenceNamespaceMaxQPS            dynamicconfig.IntPropertyFnWithNamespaceFilter
 		PersistencePerShardNamespaceMaxQPS    dynamicconfig.IntPropertyFnWithNamespaceFilter
 		EnablePersistencePriorityRateLimiting dynamicconfig.BoolPropertyFn
+		PersistenceDynamicRateLimitingParams  dynamicconfig.MapPropertyFn
 		SyncMatchWaitDuration                 dynamicconfig.DurationPropertyFnWithTaskQueueInfoFilters
 		TestDisableSyncMatch                  dynamicconfig.BoolPropertyFn
 		RPS                                   dynamicconfig.IntPropertyFn
+		OperatorRPSRatio                      dynamicconfig.FloatPropertyFn
 		ShutdownDrainDuration                 dynamicconfig.DurationPropertyFn
 
 		// taskQueueManager configuration
@@ -76,6 +81,14 @@ type (
 
 		AdminNamespaceToPartitionDispatchRate          dynamicconfig.FloatPropertyFnWithNamespaceFilter
 		AdminNamespaceTaskqueueToPartitionDispatchRate dynamicconfig.FloatPropertyFnWithTaskQueueInfoFilters
+
+		VisibilityPersistenceMaxReadQPS   dynamicconfig.IntPropertyFn
+		VisibilityPersistenceMaxWriteQPS  dynamicconfig.IntPropertyFn
+		EnableReadFromSecondaryVisibility dynamicconfig.BoolPropertyFnWithNamespaceFilter
+		VisibilityDisableOrderByClause    dynamicconfig.BoolPropertyFnWithNamespaceFilter
+		VisibilityEnableManualPagination  dynamicconfig.BoolPropertyFnWithNamespaceFilter
+
+		LoadUserData dynamicconfig.BoolPropertyFnWithTaskQueueInfoFilters
 	}
 
 	forwarderConfig struct {
@@ -111,11 +124,23 @@ type (
 		AdminNamespaceToPartitionDispatchRate func() float64
 		// partition qps = AdminNamespaceTaskQueueToPartitionDispatchRate(namespace, task_queue)
 		AdminNamespaceTaskQueueToPartitionDispatchRate func() float64
+
+		// If set to false, matching does not load user data from DB for root partitions or fetch it via RPC from the
+		// root. When disabled, features that rely on user data (e.g. worker versioning) will essentially be disabled.
+		// See the documentation for constants.MatchingLoadUserData for the implications on versioning.
+		LoadUserData func() bool
+
+		// Retry policy for fetching user data from root partition. Should retry forever.
+		GetUserDataRetryPolicy backoff.RetryPolicy
 	}
 )
 
 // NewConfig returns new service config with default values
-func NewConfig(dc *dynamicconfig.Collection) *Config {
+func NewConfig(
+	dc *dynamicconfig.Collection,
+	visibilityStoreConfigExist bool,
+	enableReadFromES bool,
+) *Config {
 	defaultUpdateAckInterval := []dynamicconfig.ConstrainedValue{
 		// Use a longer default interval for the per-namespace internal worker queues.
 		{
@@ -135,9 +160,12 @@ func NewConfig(dc *dynamicconfig.Collection) *Config {
 		PersistenceNamespaceMaxQPS:            dc.GetIntPropertyFilteredByNamespace(dynamicconfig.MatchingPersistenceNamespaceMaxQPS, 0),
 		PersistencePerShardNamespaceMaxQPS:    dynamicconfig.DefaultPerShardNamespaceRPSMax,
 		EnablePersistencePriorityRateLimiting: dc.GetBoolProperty(dynamicconfig.MatchingEnablePersistencePriorityRateLimiting, true),
+		PersistenceDynamicRateLimitingParams:  dc.GetMapProperty(dynamicconfig.MatchingPersistenceDynamicRateLimitingParams, dynamicconfig.DefaultDynamicRateLimitingParams),
 		SyncMatchWaitDuration:                 dc.GetDurationPropertyFilteredByTaskQueueInfo(dynamicconfig.MatchingSyncMatchWaitDuration, 200*time.Millisecond),
 		TestDisableSyncMatch:                  dc.GetBoolProperty(dynamicconfig.TestMatchingDisableSyncMatch, false),
+		LoadUserData:                          dc.GetBoolPropertyFilteredByTaskQueueInfo(dynamicconfig.MatchingLoadUserData, true),
 		RPS:                                   dc.GetIntProperty(dynamicconfig.MatchingRPS, 1200),
+		OperatorRPSRatio:                      dc.GetFloat64Property(dynamicconfig.OperatorRPSRatio, common.DefaultOperatorRPSRatio),
 		RangeSize:                             100000,
 		GetTasksBatchSize:                     dc.GetIntPropertyFilteredByTaskQueueInfo(dynamicconfig.MatchingGetTasksBatchSize, 1000),
 		UpdateAckInterval:                     dc.GetDurationPropertyFilteredByTaskQueueInfo(dynamicconfig.MatchingUpdateAckInterval, defaultUpdateAckInterval),
@@ -156,17 +184,23 @@ func NewConfig(dc *dynamicconfig.Collection) *Config {
 		ForwarderMaxChildrenPerNode:           dc.GetIntPropertyFilteredByTaskQueueInfo(dynamicconfig.MatchingForwarderMaxChildrenPerNode, 20),
 		ShutdownDrainDuration:                 dc.GetDurationProperty(dynamicconfig.MatchingShutdownDrainDuration, 0*time.Second),
 		VersionCompatibleSetLimitPerQueue:     dc.GetIntProperty(dynamicconfig.VersionCompatibleSetLimitPerQueue, 10),
-		VersionBuildIdLimitPerQueue:           dc.GetIntProperty(dynamicconfig.VersionBuildIdLimitPerQueue, 1000),
+		VersionBuildIdLimitPerQueue:           dc.GetIntProperty(dynamicconfig.VersionBuildIdLimitPerQueue, 100),
 		TaskQueueLimitPerBuildId:              dc.GetIntProperty(dynamicconfig.TaskQueuesPerBuildIdLimit, 20),
 		GetUserDataLongPollTimeout:            dc.GetDurationProperty(dynamicconfig.MatchingGetUserDataLongPollTimeout, 5*time.Minute),
 
 		AdminNamespaceToPartitionDispatchRate:          dc.GetFloatPropertyFilteredByNamespace(dynamicconfig.AdminMatchingNamespaceToPartitionDispatchRate, 10000),
 		AdminNamespaceTaskqueueToPartitionDispatchRate: dc.GetFloatPropertyFilteredByTaskQueueInfo(dynamicconfig.AdminMatchingNamespaceTaskqueueToPartitionDispatchRate, 1000),
+
+		VisibilityPersistenceMaxReadQPS:   visibility.GetVisibilityPersistenceMaxReadQPS(dc, enableReadFromES),
+		VisibilityPersistenceMaxWriteQPS:  visibility.GetVisibilityPersistenceMaxWriteQPS(dc, enableReadFromES),
+		EnableReadFromSecondaryVisibility: visibility.GetEnableReadFromSecondaryVisibilityConfig(dc, visibilityStoreConfigExist, enableReadFromES),
+		VisibilityDisableOrderByClause:    dc.GetBoolPropertyFnWithNamespaceFilter(dynamicconfig.VisibilityDisableOrderByClause, true),
+		VisibilityEnableManualPagination:  dc.GetBoolPropertyFnWithNamespaceFilter(dynamicconfig.VisibilityEnableManualPagination, true),
 	}
 }
 
 func newTaskQueueConfig(id *taskQueueID, config *Config, namespace namespace.Name) *taskQueueConfig {
-	taskQueueName := id.FullName()
+	taskQueueName := id.BaseNameString()
 	taskType := id.taskType
 
 	return &taskQueueConfig{
@@ -187,6 +221,9 @@ func newTaskQueueConfig(id *taskQueueID, config *Config, namespace namespace.Nam
 			return config.SyncMatchWaitDuration(namespace.String(), taskQueueName, taskType)
 		},
 		TestDisableSyncMatch: config.TestDisableSyncMatch,
+		LoadUserData: func() bool {
+			return config.LoadUserData(namespace.String(), taskQueueName, taskType)
+		},
 		LongPollExpirationInterval: func() time.Duration {
 			return config.LongPollExpirationInterval(namespace.String(), taskQueueName, taskType)
 		},
@@ -227,5 +264,6 @@ func newTaskQueueConfig(id *taskQueueID, config *Config, namespace namespace.Nam
 				return util.Max(1, config.ForwarderMaxChildrenPerNode(namespace.String(), taskQueueName, taskType))
 			},
 		},
+		GetUserDataRetryPolicy: backoff.NewExponentialRetryPolicy(1 * time.Second).WithMaximumInterval(5 * time.Minute),
 	}
 }

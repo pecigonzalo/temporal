@@ -367,14 +367,12 @@ func (c *temporalImpl) startFrontend(hosts map[primitives.ServiceName][]string, 
 		}
 	}
 
-	stoppedCh := make(chan struct{})
 	var frontendService *frontend.Service
 	var clientBean client.Bean
 	var namespaceRegistry namespace.Registry
 	var rpcFactory common.RPCFactory
 	feApp := fx.New(
 		fx.Supply(
-			stoppedCh,
 			persistenceConfig,
 			serviceName,
 		),
@@ -384,7 +382,10 @@ func (c *temporalImpl) startFrontend(hosts map[primitives.ServiceName][]string, 
 		fx.Provide(func() resource.NamespaceLogger { return c.logger }),
 		fx.Provide(newRPCFactoryImpl),
 		fx.Provide(func() membership.Monitor {
-			return newSimpleMonitor(serviceName, hosts)
+			return newSimpleMonitor(hosts)
+		}),
+		fx.Provide(func() membership.HostInfoProvider {
+			return newSimpleHostInfoProvider(serviceName, hosts)
 		}),
 		fx.Provide(func() *cluster.Config { return c.clusterMetadataConfig }),
 		fx.Provide(func() carchiver.ArchivalMetadata { return c.archiverMetadata }),
@@ -461,13 +462,11 @@ func (c *temporalImpl) startHistory(
 			}
 		}
 
-		stoppedCh := make(chan struct{})
 		var historyService *history.Service
 		var clientBean client.Bean
 		var namespaceRegistry namespace.Registry
 		app := fx.New(
 			fx.Supply(
-				stoppedCh,
 				persistenceConfig,
 				serviceName,
 			),
@@ -477,7 +476,10 @@ func (c *temporalImpl) startHistory(
 			fx.Provide(func() log.ThrottledLogger { return c.logger }),
 			fx.Provide(newRPCFactoryImpl),
 			fx.Provide(func() membership.Monitor {
-				return newSimpleMonitor(serviceName, hosts)
+				return newSimpleMonitor(hosts)
+			}),
+			fx.Provide(func() membership.HostInfoProvider {
+				return newSimpleHostInfoProvider(serviceName, hosts)
 			}),
 			fx.Provide(func() *cluster.Config { return c.clusterMetadataConfig }),
 			fx.Provide(func() carchiver.ArchivalMetadata { return c.archiverMetadata }),
@@ -546,16 +548,21 @@ func (c *temporalImpl) startMatching(hosts map[primitives.ServiceName][]string, 
 
 	persistenceConfig, err := copyPersistenceConfig(c.persistenceConfig)
 	if err != nil {
-		c.logger.Fatal("Failed to copy persistence config for history", tag.Error(err))
+		c.logger.Fatal("Failed to copy persistence config for matching", tag.Error(err))
+	}
+	if c.esConfig != nil {
+		esDataStoreName := "es-visibility"
+		persistenceConfig.AdvancedVisibilityStore = esDataStoreName
+		persistenceConfig.DataStores[esDataStoreName] = config.DataStore{
+			Elasticsearch: c.esConfig,
+		}
 	}
 
-	stoppedCh := make(chan struct{})
 	var matchingService *matching.Service
 	var clientBean client.Bean
 	var namespaceRegistry namespace.Registry
 	app := fx.New(
 		fx.Supply(
-			stoppedCh,
 			persistenceConfig,
 			serviceName,
 		),
@@ -564,7 +571,10 @@ func (c *temporalImpl) startMatching(hosts map[primitives.ServiceName][]string, 
 		fx.Provide(func() log.ThrottledLogger { return c.logger }),
 		fx.Provide(newRPCFactoryImpl),
 		fx.Provide(func() membership.Monitor {
-			return newSimpleMonitor(serviceName, hosts)
+			return newSimpleMonitor(hosts)
+		}),
+		fx.Provide(func() membership.HostInfoProvider {
+			return newSimpleHostInfoProvider(serviceName, hosts)
 		}),
 		fx.Provide(func() *cluster.Config { return c.clusterMetadataConfig }),
 		fx.Provide(func() carchiver.ArchivalMetadata { return c.archiverMetadata }),
@@ -575,6 +585,8 @@ func (c *temporalImpl) startMatching(hosts map[primitives.ServiceName][]string, 
 		fx.Provide(persistenceClient.FactoryProvider),
 		fx.Provide(func() persistenceClient.AbstractDataStoreFactory { return nil }),
 		fx.Provide(func() dynamicconfig.Client { return c.dcClient }),
+		fx.Provide(func() *esclient.Config { return c.esConfig }),
+		fx.Provide(func() esclient.Client { return c.esClient }),
 		fx.Provide(func() log.Logger { return c.logger }),
 		fx.Provide(resource.DefaultSnTaggedLoggerProvider),
 		fx.Supply(c.spanExporters),
@@ -638,13 +650,11 @@ func (c *temporalImpl) startWorker(hosts map[primitives.ServiceName][]string, st
 		clusterConfigCopy.EnableGlobalNamespace = true
 	}
 
-	stoppedCh := make(chan struct{})
 	var workerService *worker.Service
 	var clientBean client.Bean
 	var namespaceRegistry namespace.Registry
 	app := fx.New(
 		fx.Supply(
-			stoppedCh,
 			persistenceConfig,
 			serviceName,
 		),
@@ -654,7 +664,10 @@ func (c *temporalImpl) startWorker(hosts map[primitives.ServiceName][]string, st
 		fx.Provide(func() log.ThrottledLogger { return c.logger }),
 		fx.Provide(newRPCFactoryImpl),
 		fx.Provide(func() membership.Monitor {
-			return newSimpleMonitor(serviceName, hosts)
+			return newSimpleMonitor(hosts)
+		}),
+		fx.Provide(func() membership.HostInfoProvider {
+			return newSimpleHostInfoProvider(serviceName, hosts)
 		}),
 		fx.Provide(func() *cluster.Config { return &clusterConfigCopy }),
 		fx.Provide(func() carchiver.ArchivalMetadata { return c.archiverMetadata }),
@@ -843,4 +856,9 @@ func (c *rpcFactoryImpl) CreateGRPCConnection(hostName string) *grpc.ClientConn 
 	}
 
 	return connection
+}
+
+func newSimpleHostInfoProvider(serviceName primitives.ServiceName, hosts map[primitives.ServiceName][]string) membership.HostInfoProvider {
+	hostInfo := membership.NewHostInfoFromAddress(hosts[serviceName][0])
+	return membership.NewHostInfoProvider(hostInfo)
 }

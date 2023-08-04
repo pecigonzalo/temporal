@@ -47,6 +47,7 @@ import (
 	historyspb "go.temporal.io/server/api/history/v1"
 	"go.temporal.io/server/api/historyservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	updatespb "go.temporal.io/server/api/update/v1"
 	workflowspb "go.temporal.io/server/api/workflow/v1"
 	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/backoff"
@@ -65,6 +66,7 @@ import (
 	"go.temporal.io/server/common/persistence/versionhistory"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/worker_versioning"
 	"go.temporal.io/server/service/history/configs"
 	"go.temporal.io/server/service/history/consts"
 	"go.temporal.io/server/service/history/events"
@@ -715,6 +717,12 @@ func (ms *MutableStateImpl) GetQueryRegistry() QueryRegistry {
 	return ms.QueryRegistry
 }
 
+func (ms *MutableStateImpl) VisitUpdates(visitor func(updID string, updInfo *updatespb.UpdateInfo)) {
+	for updID, updInfo := range ms.executionInfo.GetUpdateInfos() {
+		visitor(updID, updInfo)
+	}
+}
+
 func (ms *MutableStateImpl) GetUpdateOutcome(
 	ctx context.Context,
 	updateID string,
@@ -726,12 +734,11 @@ func (ms *MutableStateImpl) GetUpdateOutcome(
 	if !ok {
 		return nil, serviceerror.NewNotFound("update not found")
 	}
-	compPtr := rec.GetCompletedPointer()
-	if compPtr == nil {
-		// not an error because update was found, but update has not completed
-		return nil, nil
+	completion := rec.GetCompletion()
+	if completion == nil {
+		return nil, serviceerror.NewInternal("update has not completed")
 	}
-	currentBranchToken, version, err := ms.getCurrentBranchTokenAndEventVersion(compPtr.EventId)
+	currentBranchToken, version, err := ms.getCurrentBranchTokenAndEventVersion(completion.EventId)
 	if err != nil {
 		return nil, err
 	}
@@ -739,10 +746,10 @@ func (ms *MutableStateImpl) GetUpdateOutcome(
 		NamespaceID: namespace.ID(ms.executionInfo.NamespaceId),
 		WorkflowID:  ms.executionInfo.WorkflowId,
 		RunID:       ms.executionState.RunId,
-		EventID:     compPtr.EventId,
+		EventID:     completion.EventId,
 		Version:     version,
 	}
-	event, err := ms.eventsCache.GetEvent(ctx, eventKey, compPtr.EventId-1, currentBranchToken)
+	event, err := ms.eventsCache.GetEvent(ctx, eventKey, completion.EventBatchId, currentBranchToken)
 	if err != nil {
 		return nil, err
 	}
@@ -823,6 +830,23 @@ func (ms *MutableStateImpl) GetActivityByActivityID(
 		return nil, false
 	}
 	return ms.GetActivityInfo(eventID)
+}
+
+// GetActivityType gets the ActivityType from ActivityInfo if set,
+// or from the events history otherwise for backwards compatibility.
+func (ms *MutableStateImpl) GetActivityType(
+	ctx context.Context,
+	ai *persistencespb.ActivityInfo,
+) (*commonpb.ActivityType, error) {
+	if ai.GetActivityType() != nil {
+		return ai.GetActivityType(), nil
+	}
+	// For backwards compatibility in case ActivityType is not set in ActivityInfo.
+	scheduledEvent, err := ms.GetActivityScheduledEvent(ctx, ai.ScheduledEventId)
+	if err != nil {
+		return nil, err
+	}
+	return scheduledEvent.GetActivityTaskScheduledEventAttributes().ActivityType, nil
 }
 
 // GetChildExecutionInfo gives details about a child execution that is currently in progress.
@@ -1657,7 +1681,7 @@ func (ms *MutableStateImpl) addWorkflowExecutionStartedEventForContinueAsNew(
 	// - using versioning
 	var sourceVersionStamp *commonpb.WorkerVersionStamp
 	if command.UseCompatibleVersion {
-		sourceVersionStamp = common.StampIfUsingVersioning(previousExecutionInfo.WorkerVersionStamp)
+		sourceVersionStamp = worker_versioning.StampIfUsingVersioning(previousExecutionInfo.WorkerVersionStamp)
 	}
 
 	req := &historyservice.StartWorkflowExecutionRequest{
@@ -1894,8 +1918,8 @@ func (ms *MutableStateImpl) ReplicateWorkflowExecutionStartedEvent(
 		ms.executionInfo.SearchAttributes = event.SearchAttributes.GetIndexedFields()
 	}
 	if event.SourceVersionStamp.GetUseVersioning() && event.SourceVersionStamp.GetBuildId() != "" {
-		limit := ms.config.MaxTrackedBuildIds(string(ms.namespaceEntry.Name()))
-		if err := ms.addBuildIdWithNoVisibilityTask(common.VersionedBuildIdSearchAttribute(event.SourceVersionStamp.BuildId), limit); err != nil {
+		limit := ms.config.SearchAttributesSizeOfValueLimit(string(ms.namespaceEntry.Name()))
+		if _, err := ms.addBuildIdsWithNoVisibilityTask([]string{worker_versioning.VersionedBuildIdSearchAttribute(event.SourceVersionStamp.BuildId)}, limit); err != nil {
 			return err
 		}
 	}
@@ -2089,28 +2113,21 @@ func (ms *MutableStateImpl) trackBuildIdFromCompletion(
 	eventID int64,
 	limits WorkflowTaskCompletionLimits,
 ) error {
-	buildIds, err := ms.loadBuildIds()
-	if err != nil {
-		return err
-	}
-	anyAdded := false
+	var toAdd []string
 	if !version.GetUseVersioning() {
-		var added bool
-		// Make sure unversioned workflow tasks are easily locatable with just the prefix
-		buildIds, added = ms.addBuildIdToLoadedSearchAttribute(buildIds, common.UnversionedSearchAttribute, limits.MaxTrackedBuildIds)
-		anyAdded = anyAdded || added
+		toAdd = append(toAdd, worker_versioning.UnversionedSearchAttribute)
 	}
 	if version.GetBuildId() != "" {
-		var added bool
 		ms.addResetPointFromCompletion(version.GetBuildId(), eventID, limits.MaxResetPoints)
-		buildIds, added = ms.addBuildIdToLoadedSearchAttribute(buildIds, common.VersionStampToBuildIdSearchAttribute(version), limits.MaxTrackedBuildIds)
-		anyAdded = anyAdded || added
+		toAdd = append(toAdd, worker_versioning.VersionStampToBuildIdSearchAttribute(version))
 	}
-	if !anyAdded {
+	if len(toAdd) == 0 {
 		return nil
 	}
-	if err := ms.saveBuildIds(buildIds); err != nil {
+	if changed, err := ms.addBuildIdsWithNoVisibilityTask(toAdd, limits.MaxSearchAttributeValueSize); err != nil {
 		return err
+	} else if !changed {
+		return nil
 	}
 	return ms.taskGenerator.GenerateUpsertVisibilityTask()
 }
@@ -2123,68 +2140,79 @@ func (ms *MutableStateImpl) loadBuildIds() ([]string, error) {
 	saPayload, found := searchAttributes[searchattribute.BuildIds]
 	if !found {
 		return []string{}, nil
-	} else {
-		decoded, err := searchattribute.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, true)
-		if err != nil {
-			return nil, err
-		}
-		searchAttributeValues, ok := decoded.([]string)
-		if !ok {
-			return nil, serviceerror.NewInternal("invalid search attribute value stored for BuildIds")
-		}
-		return searchAttributeValues, nil
 	}
+	decoded, err := searchattribute.DecodeValue(saPayload, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST, true)
+	if err != nil {
+		return nil, err
+	}
+	searchAttributeValues, ok := decoded.([]string)
+	if !ok {
+		return nil, serviceerror.NewInternal("invalid search attribute value stored for BuildIds")
+	}
+	return searchAttributeValues, nil
 }
 
-// Takes a list of loaded build IDs from a search attribute and added a new build ID to it while respecting provided limits.
-// Returns a potentially modified list and a flag indicating whether it was modified.
-func (ms *MutableStateImpl) addBuildIdToLoadedSearchAttribute(searchAttributeValues []string, searchAttributeValue string, maxTrackedBuildIds int) ([]string, bool) {
-	if maxTrackedBuildIds < 1 {
-		// Can't track this build ID
-		return searchAttributeValues, false
-	}
-	for _, exisitingValue := range searchAttributeValues {
-		if exisitingValue == searchAttributeValue {
-			return searchAttributeValues, false
+// Takes a list of loaded build IDs from a search attribute and adds new build IDs to it. Returns a potentially modified
+// list and a flag indicating whether it was modified.
+func (ms *MutableStateImpl) addBuildIdToLoadedSearchAttribute(existingValues []string, newValues []string) ([]string, bool) {
+	var added []string
+	for _, newValue := range newValues {
+		found := false
+		for _, exisitingValue := range existingValues {
+			if exisitingValue == newValue {
+				found = true
+				break
+			}
+		}
+		if !found {
+			added = append(added, newValue)
 		}
 	}
-	if len(searchAttributeValues) >= maxTrackedBuildIds {
-		hasUnversioned := searchAttributeValues[0] == common.UnversionedSearchAttribute
-		searchAttributeValues = searchAttributeValues[len(searchAttributeValues)-maxTrackedBuildIds+1:]
-		// Make sure not to lose the unversioned value, it's required for the reachability API
-		if hasUnversioned {
-			searchAttributeValues[0] = common.UnversionedSearchAttribute
-		}
+	if len(added) == 0 {
+		return existingValues, false
 	}
-	return append(searchAttributeValues, searchAttributeValue), true
+	return append(existingValues, added...), true
 }
 
-func (ms *MutableStateImpl) saveBuildIds(buildIds []string) error {
+func (ms *MutableStateImpl) saveBuildIds(buildIds []string, maxSearchAttributeValueSize int) error {
 	searchAttributes := ms.executionInfo.SearchAttributes
 	if searchAttributes == nil {
 		searchAttributes = make(map[string]*commonpb.Payload, 1)
 		ms.executionInfo.SearchAttributes = searchAttributes
 	}
 
-	saPayload, err := searchattribute.EncodeValue(buildIds, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
-	if err != nil {
-		return err
+	hasUnversioned := buildIds[0] == worker_versioning.UnversionedSearchAttribute
+	for {
+		saPayload, err := searchattribute.EncodeValue(buildIds, enumspb.INDEXED_VALUE_TYPE_KEYWORD_LIST)
+		if err != nil {
+			return err
+		}
+		if len(buildIds) == 0 || len(saPayload.GetData()) <= maxSearchAttributeValueSize {
+			searchAttributes[searchattribute.BuildIds] = saPayload
+			break
+		}
+		if len(buildIds) == 1 {
+			buildIds = make([]string, 0)
+		} else if hasUnversioned {
+			// Make sure to maintain the unversioned sentinel, it's required for the reachability API
+			buildIds = append(buildIds[:1], buildIds[2:]...)
+		} else {
+			buildIds = buildIds[1:]
+		}
 	}
-	searchAttributes[searchattribute.BuildIds] = saPayload
 	return nil
 }
 
-func (ms *MutableStateImpl) addBuildIdWithNoVisibilityTask(searchAttributeValue string, maxTrackedBuildIds int) error {
-	buildIds, err := ms.loadBuildIds()
+func (ms *MutableStateImpl) addBuildIdsWithNoVisibilityTask(buildIds []string, maxSearchAttributeValueSize int) (bool, error) {
+	existingBuildIds, err := ms.loadBuildIds()
 	if err != nil {
-		return err
+		return false, err
 	}
-	var added bool
-	buildIds, added = ms.addBuildIdToLoadedSearchAttribute(buildIds, searchAttributeValue, maxTrackedBuildIds)
+	modifiedBuildIds, added := ms.addBuildIdToLoadedSearchAttribute(existingBuildIds, buildIds)
 	if !added {
-		return nil
+		return false, nil
 	}
-	return ms.saveBuildIds(buildIds)
+	return true, ms.saveBuildIds(modifiedBuildIds, maxSearchAttributeValueSize)
 }
 
 // TODO: we will release the restriction when reset API allow those pending
@@ -2340,6 +2368,7 @@ func (ms *MutableStateImpl) ReplicateActivityTaskScheduledEvent(
 		HasRetryPolicy:          attributes.RetryPolicy != nil,
 		Attempt:                 1,
 		UseCompatibleVersion:    attributes.UseCompatibleVersion,
+		ActivityType:            attributes.GetActivityType(),
 	}
 	if ai.HasRetryPolicy {
 		ai.RetryInitialInterval = attributes.RetryPolicy.GetInitialInterval()
@@ -2799,8 +2828,8 @@ func (ms *MutableStateImpl) AddFailWorkflowEvent(
 		return nil, err
 	}
 
-	event := ms.hBuilder.AddFailWorkflowEvent(workflowTaskCompletedEventID, retryState, command, newExecutionRunID)
-	if err := ms.ReplicateWorkflowExecutionFailedEvent(workflowTaskCompletedEventID, event); err != nil {
+	event, batchID := ms.hBuilder.AddFailWorkflowEvent(workflowTaskCompletedEventID, retryState, command, newExecutionRunID)
+	if err := ms.ReplicateWorkflowExecutionFailedEvent(batchID, event); err != nil {
 		return nil, err
 	}
 	// TODO merge active & passive task generation
@@ -3490,12 +3519,14 @@ func (ms *MutableStateImpl) AddWorkflowExecutionTerminatedEvent(
 
 func (ms *MutableStateImpl) AddWorkflowExecutionUpdateAcceptedEvent(
 	protocolInstanceID string,
-	updAcceptance *updatepb.Acceptance,
+	acceptedRequestMessageId string,
+	acceptedRequestSequencingEventId int64,
+	acceptedRequest *updatepb.Request,
 ) (*historypb.HistoryEvent, error) {
 	if err := ms.checkMutability(tag.WorkflowActionUpdateAccepted); err != nil {
 		return nil, err
 	}
-	event := ms.hBuilder.AddWorkflowExecutionUpdateAcceptedEvent(protocolInstanceID, updAcceptance)
+	event := ms.hBuilder.AddWorkflowExecutionUpdateAcceptedEvent(protocolInstanceID, acceptedRequestMessageId, acceptedRequestSequencingEventId, acceptedRequest)
 	if err := ms.ReplicateWorkflowExecutionUpdateAcceptedEvent(event); err != nil {
 		return nil, err
 	}
@@ -3510,86 +3541,78 @@ func (ms *MutableStateImpl) ReplicateWorkflowExecutionUpdateAcceptedEvent(
 		return serviceerror.NewInternal("wrong event type in call to ReplicateWorkflowExecutionUpdateAcceptedEvent")
 	}
 	if ms.executionInfo.UpdateInfos == nil {
-		ms.executionInfo.UpdateInfos = make(map[string]*persistencespb.UpdateInfo, 1)
+		ms.executionInfo.UpdateInfos = make(map[string]*updatespb.UpdateInfo, 1)
 	}
 	updateID := attrs.GetAcceptedRequest().GetMeta().GetUpdateId()
+	var sizeDelta int
 	if ui, ok := ms.executionInfo.UpdateInfos[updateID]; ok {
-		ui.Value = &persistencespb.UpdateInfo_AcceptancePointer{
-			AcceptancePointer: &historyspb.HistoryEventPointer{EventId: event.EventId},
+		sizeBefore := ui.Value.Size()
+		ui.Value = &updatespb.UpdateInfo_Acceptance{
+			Acceptance: &updatespb.AcceptanceInfo{EventId: event.EventId},
 		}
+		sizeDelta = ui.Value.Size() - sizeBefore
 	} else {
-		ui := persistencespb.UpdateInfo{
-			Value: &persistencespb.UpdateInfo_AcceptancePointer{
-				AcceptancePointer: &historyspb.HistoryEventPointer{EventId: event.EventId},
+		ui := updatespb.UpdateInfo{
+			Value: &updatespb.UpdateInfo_Acceptance{
+				Acceptance: &updatespb.AcceptanceInfo{EventId: event.EventId},
 			},
 		}
 		ms.executionInfo.UpdateInfos[updateID] = &ui
 		ms.executionInfo.UpdateCount++
-		ms.approximateSize += ui.Size() + len(updateID)
+		sizeDelta = ui.Size() + len(updateID)
 	}
+	ms.approximateSize += sizeDelta
 	ms.writeEventToCache(event)
 	return nil
 }
 
 func (ms *MutableStateImpl) AddWorkflowExecutionUpdateCompletedEvent(
+	acceptedEventID int64,
 	updResp *updatepb.Response,
 ) (*historypb.HistoryEvent, error) {
 	if err := ms.checkMutability(tag.WorkflowActionUpdateCompleted); err != nil {
 		return nil, err
 	}
-	event := ms.hBuilder.AddWorkflowExecutionUpdateCompletedEvent(updResp)
-	if err := ms.ReplicateWorkflowExecutionUpdateCompletedEvent(event); err != nil {
+	event, batchID := ms.hBuilder.AddWorkflowExecutionUpdateCompletedEvent(acceptedEventID, updResp)
+	if err := ms.ReplicateWorkflowExecutionUpdateCompletedEvent(event, batchID); err != nil {
 		return nil, err
 	}
 	return event, nil
 }
 
-func (ms *MutableStateImpl) GetAcceptedWorkflowExecutionUpdateIDs(context.Context) []string {
-	if ms.executionInfo.UpdateInfos == nil {
-		return nil
-	}
-	out := make([]string, 0)
-	for id, updateInfo := range ms.executionInfo.UpdateInfos {
-		if updateInfo.GetAcceptancePointer() != nil {
-			out = append(out, id)
-		}
-	}
-	return out
-}
-
-func (ms *MutableStateImpl) GetUpdateInfo(ctx context.Context, updateID string) (*persistencespb.UpdateInfo, bool) {
-	if ms.executionInfo.UpdateInfos == nil {
-		return nil, false
-	}
-	info, ok := ms.executionInfo.UpdateInfos[updateID]
-	return info, ok
-}
-
 func (ms *MutableStateImpl) ReplicateWorkflowExecutionUpdateCompletedEvent(
 	event *historypb.HistoryEvent,
+	batchID int64,
 ) error {
 	attrs := event.GetWorkflowExecutionUpdateCompletedEventAttributes()
 	if attrs == nil {
 		return serviceerror.NewInternal("wrong event type in call to ReplicateWorkflowExecutionUpdateCompletedEvent")
 	}
 	if ms.executionInfo.UpdateInfos == nil {
-		ms.executionInfo.UpdateInfos = make(map[string]*persistencespb.UpdateInfo, 1)
+		ms.executionInfo.UpdateInfos = make(map[string]*updatespb.UpdateInfo, 1)
 	}
 	updateID := attrs.GetMeta().GetUpdateId()
+	var sizeDelta int
 	if ui, ok := ms.executionInfo.UpdateInfos[updateID]; ok {
-		ui.Value = &persistencespb.UpdateInfo_CompletedPointer{
-			CompletedPointer: &historyspb.HistoryEventPointer{EventId: event.EventId},
+		sizeBefore := ui.Value.Size()
+		ui.Value = &updatespb.UpdateInfo_Completion{
+			Completion: &updatespb.CompletionInfo{
+				EventId:      event.EventId,
+				EventBatchId: batchID,
+			},
 		}
+		sizeDelta = ui.Value.Size() - sizeBefore
 	} else {
-		ui := persistencespb.UpdateInfo{
-			Value: &persistencespb.UpdateInfo_CompletedPointer{
-				CompletedPointer: &historyspb.HistoryEventPointer{EventId: event.EventId},
+		ui := updatespb.UpdateInfo{
+			Value: &updatespb.UpdateInfo_Completion{
+				Completion: &updatespb.CompletionInfo{EventId: event.EventId},
 			},
 		}
 		ms.executionInfo.UpdateInfos[updateID] = &ui
 		ms.executionInfo.UpdateCount++
-		ms.approximateSize += ui.Size() + len(updateID)
+		sizeDelta = ui.Size() + len(updateID)
 	}
+	ms.approximateSize += sizeDelta
 	ms.writeEventToCache(event)
 	return nil
 }
@@ -4374,6 +4397,17 @@ func (ms *MutableStateImpl) UpdateWorkflowStateStatus(
 func (ms *MutableStateImpl) StartTransaction(
 	namespaceEntry *namespace.Namespace,
 ) (bool, error) {
+	if ms.hBuilder.IsDirty() || len(ms.InsertTasks) > 0 {
+		ms.logger.Error("MutableState encountered dirty transaction",
+			tag.WorkflowNamespaceID(ms.executionInfo.NamespaceId),
+			tag.WorkflowID(ms.executionInfo.WorkflowId),
+			tag.WorkflowRunID(ms.executionState.RunId),
+			tag.Value(ms.hBuilder),
+		)
+		ms.metricsHandler.Counter(metrics.MutableStateChecksumInvalidated.GetMetricName()).Record(1)
+		return false, serviceerror.NewUnavailable("MutableState encountered dirty transaction")
+	}
+
 	namespaceEntry, err := ms.startTransactionHandleNamespaceMigration(namespaceEntry)
 	if err != nil {
 		return false, err

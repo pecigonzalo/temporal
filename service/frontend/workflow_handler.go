@@ -77,12 +77,14 @@ import (
 	"go.temporal.io/server/common/persistence/serialization"
 	"go.temporal.io/server/common/persistence/visibility"
 	"go.temporal.io/server/common/persistence/visibility/manager"
+	"go.temporal.io/server/common/persistence/visibility/store"
 	"go.temporal.io/server/common/primitives"
 	"go.temporal.io/server/common/primitives/timestamp"
 	"go.temporal.io/server/common/rpc"
 	"go.temporal.io/server/common/rpc/interceptor"
 	"go.temporal.io/server/common/sdk"
 	"go.temporal.io/server/common/searchattribute"
+	"go.temporal.io/server/common/tasktoken"
 	"go.temporal.io/server/common/util"
 	"go.temporal.io/server/service/worker/batcher"
 	"go.temporal.io/server/service/worker/scheduler"
@@ -189,7 +191,7 @@ func NewWorkflowHandler(
 			config.SearchAttributesNumberOfKeysLimit,
 			config.SearchAttributesSizeOfValueLimit,
 			config.SearchAttributesTotalSizeLimit,
-			visibilityMrg.GetIndexName(),
+			visibilityMrg,
 			visibility.AllowListForValidation(visibilityMrg.GetStoreNames()),
 		),
 		archivalMetadata:  archivalMetadata,
@@ -877,9 +879,10 @@ func (wh *WorkflowHandler) PollWorkflowTaskQueue(ctx context.Context, request *w
 			return &workflowservice.PollWorkflowTaskQueueResponse{}, nil
 		}
 
-		// For newer build error, return silently.
-		var newerBuild *serviceerror.NewerBuildExists
-		if errors.As(err, &newerBuild) {
+		// These errors are expected from some versioning situations. We should not log them, it'd be too noisy.
+		var newerBuild *serviceerror.NewerBuildExists      // expected when versioned poller is superceded
+		var failedPrecond *serviceerror.FailedPrecondition // expected when user data is disabled
+		if errors.As(err, &newerBuild) || errors.As(err, &failedPrecond) {
 			return nil, err
 		}
 
@@ -959,13 +962,17 @@ func (wh *WorkflowHandler) RespondWorkflowTaskCompleted(
 		ResetHistoryEventId: histResp.ResetHistoryEventId,
 	}
 	if request.GetReturnNewWorkflowTask() && histResp != nil && histResp.StartedResponse != nil {
-		taskToken := &tokenspb.Task{
-			NamespaceId:      taskToken.GetNamespaceId(),
-			WorkflowId:       taskToken.GetWorkflowId(),
-			RunId:            taskToken.GetRunId(),
-			ScheduledEventId: histResp.StartedResponse.GetScheduledEventId(),
-			Attempt:          histResp.StartedResponse.GetAttempt(),
-		}
+		taskToken := tasktoken.NewWorkflowTaskToken(
+			taskToken.GetNamespaceId(),
+			taskToken.GetWorkflowId(),
+			taskToken.GetRunId(),
+			histResp.StartedResponse.GetScheduledEventId(),
+			histResp.StartedResponse.GetStartedEventId(),
+			histResp.StartedResponse.GetStartedTime(),
+			histResp.StartedResponse.GetAttempt(),
+			histResp.StartedResponse.GetClock(),
+			histResp.StartedResponse.GetVersion(),
+		)
 		token, err := wh.tokenSerializer.Serialize(taskToken)
 		if err != nil {
 			return nil, err
@@ -1113,9 +1120,10 @@ func (wh *WorkflowHandler) PollActivityTaskQueue(ctx context.Context, request *w
 			return &workflowservice.PollActivityTaskQueueResponse{}, nil
 		}
 
-		// For newer build error, return silently.
-		var newerBuild *serviceerror.NewerBuildExists
-		if errors.As(err, &newerBuild) {
+		// These errors are expected from some versioning situations. We should not log them, it'd be too noisy.
+		var newerBuild *serviceerror.NewerBuildExists      // expected when versioned poller is superceded
+		var failedPrecond *serviceerror.FailedPrecondition // expected when user data is disabled
+		if errors.As(err, &newerBuild) || errors.As(err, &failedPrecond) {
 			return nil, err
 		}
 
@@ -1245,14 +1253,17 @@ func (wh *WorkflowHandler) RecordActivityTaskHeartbeatById(ctx context.Context, 
 		return nil, errActivityIDNotSet
 	}
 
-	taskToken := &tokenspb.Task{
-		NamespaceId:      namespaceID.String(),
-		RunId:            runID,
-		WorkflowId:       workflowID,
-		ScheduledEventId: common.EmptyEventID,
-		ActivityId:       activityID,
-		Attempt:          1,
-	}
+	taskToken := tasktoken.NewActivityTaskToken(
+		namespaceID.String(),
+		workflowID,
+		runID,
+		common.EmptyEventID,
+		activityID,
+		"",
+		1,
+		nil,
+		common.EmptyVersion,
+	)
 	token, err := wh.tokenSerializer.Serialize(taskToken)
 	if err != nil {
 		return nil, err
@@ -1409,14 +1420,17 @@ func (wh *WorkflowHandler) RespondActivityTaskCompletedById(ctx context.Context,
 		return nil, errIdentityTooLong
 	}
 
-	taskToken := &tokenspb.Task{
-		NamespaceId:      namespaceID.String(),
-		RunId:            runID,
-		WorkflowId:       workflowID,
-		ScheduledEventId: common.EmptyEventID,
-		ActivityId:       activityID,
-		Attempt:          1,
-	}
+	taskToken := tasktoken.NewActivityTaskToken(
+		namespaceID.String(),
+		workflowID,
+		runID,
+		common.EmptyEventID,
+		activityID,
+		"",
+		1,
+		nil,
+		common.EmptyVersion,
+	)
 	token, err := wh.tokenSerializer.Serialize(taskToken)
 	if err != nil {
 		return nil, err
@@ -1590,14 +1604,17 @@ func (wh *WorkflowHandler) RespondActivityTaskFailedById(ctx context.Context, re
 		return nil, errIdentityTooLong
 	}
 
-	taskToken := &tokenspb.Task{
-		NamespaceId:      namespaceID.String(),
-		RunId:            runID,
-		WorkflowId:       workflowID,
-		ScheduledEventId: common.EmptyEventID,
-		ActivityId:       activityID,
-		Attempt:          1,
-	}
+	taskToken := tasktoken.NewActivityTaskToken(
+		namespaceID.String(),
+		workflowID,
+		runID,
+		common.EmptyEventID,
+		activityID,
+		"",
+		1,
+		nil,
+		common.EmptyVersion,
+	)
 	token, err := wh.tokenSerializer.Serialize(taskToken)
 	if err != nil {
 		return nil, err
@@ -1763,14 +1780,17 @@ func (wh *WorkflowHandler) RespondActivityTaskCanceledById(ctx context.Context, 
 		return nil, errIdentityTooLong
 	}
 
-	taskToken := &tokenspb.Task{
-		NamespaceId:      namespaceID.String(),
-		RunId:            runID,
-		WorkflowId:       workflowID,
-		ScheduledEventId: common.EmptyEventID,
-		ActivityId:       activityID,
-		Attempt:          1,
-	}
+	taskToken := tasktoken.NewActivityTaskToken(
+		namespaceID.String(),
+		workflowID,
+		runID,
+		common.EmptyEventID,
+		activityID,
+		"",
+		1,
+		nil,
+		common.EmptyVersion,
+	)
 	token, err := wh.tokenSerializer.Serialize(taskToken)
 	if err != nil {
 		return nil, err
@@ -2457,7 +2477,8 @@ func (wh *WorkflowHandler) CountWorkflowExecutions(ctx context.Context, request 
 	}
 
 	resp := &workflowservice.CountWorkflowExecutionsResponse{
-		Count: persistenceResp.Count,
+		Count:  persistenceResp.Count,
+		Groups: persistenceResp.Groups,
 	}
 	return resp, nil
 }
@@ -3570,7 +3591,12 @@ func (wh *WorkflowHandler) UpdateWorkerBuildIdCompatibility(ctx context.Context,
 
 	matchingResponse, err := wh.matchingClient.UpdateWorkerBuildIdCompatibility(ctx, &matchingservice.UpdateWorkerBuildIdCompatibilityRequest{
 		NamespaceId: namespaceID.String(),
-		Request:     request,
+		TaskQueue:   request.GetTaskQueue(),
+		Operation: &matchingservice.UpdateWorkerBuildIdCompatibilityRequest_ApplyPublicRequest_{
+			ApplyPublicRequest: &matchingservice.UpdateWorkerBuildIdCompatibilityRequest_ApplyPublicRequest{
+				Request: request,
+			},
+		},
 	})
 
 	if matchingResponse == nil {
@@ -3707,15 +3733,43 @@ func (wh *WorkflowHandler) StartBatchOperation(
 	}
 
 	// Validate concurrent batch operation
+	maxConcurrentBatchOperation := wh.config.MaxConcurrentBatchOperation(request.GetNamespace())
 	countResp, err := wh.CountWorkflowExecutions(ctx, &workflowservice.CountWorkflowExecutionsRequest{
 		Namespace: request.GetNamespace(),
 		Query:     batcher.OpenBatchOperationQuery,
 	})
-	if err != nil {
-		return nil, err
+	openBatchOperationCount := 0
+	if err == nil {
+		openBatchOperationCount = int(countResp.GetCount())
+	} else {
+		if !errors.Is(err, store.OperationNotSupportedErr) {
+			return nil, err
+		}
+		// Some std visibility stores don't yet support CountWorkflowExecutions, even though some
+		// batch operations are still possible on those store (eg. by specyfing a list of Executions
+		// rather than a VisibilityQuery). Fallback to ListOpenWorkflowExecutions in these cases.
+		// TODO: Remove this once all std visibility stores support CountWorkflowExecutions.
+		nextPageToken := []byte{}
+		for nextPageToken != nil && openBatchOperationCount < maxConcurrentBatchOperation {
+			listResp, err := wh.ListOpenWorkflowExecutions(ctx, &workflowservice.ListOpenWorkflowExecutionsRequest{
+				Namespace: request.GetNamespace(),
+				Filters: &workflowservice.ListOpenWorkflowExecutionsRequest_TypeFilter{
+					TypeFilter: &filterpb.WorkflowTypeFilter{
+						Name: batcher.BatchWFTypeName,
+					},
+				},
+				MaximumPageSize: int32(maxConcurrentBatchOperation - openBatchOperationCount),
+				NextPageToken:   nextPageToken,
+			})
+			if err != nil {
+				return nil, err
+			}
+			openBatchOperationCount += len(listResp.Executions)
+			nextPageToken = listResp.NextPageToken
+		}
 	}
-	if countResp.GetCount() >= int64(wh.config.MaxConcurrentBatchOperation(request.GetNamespace())) {
-		return nil, serviceerror.NewUnavailable("Max concurrent batch operations is reached")
+	if openBatchOperationCount >= maxConcurrentBatchOperation {
+		return nil, serviceerror.NewResourceExhausted(enumspb.RESOURCE_EXHAUSTED_CAUSE_CONCURRENT_LIMIT, "Max concurrent batch operations is reached")
 	}
 
 	namespaceID, err := wh.namespaceRegistry.GetNamespaceID(namespace.Name(request.GetNamespace()))
@@ -3725,6 +3779,7 @@ func (wh *WorkflowHandler) StartBatchOperation(
 	var identity string
 	var operationType string
 	var signalParams batcher.SignalParams
+	var resetParams batcher.ResetParams
 	switch op := request.Operation.(type) {
 	case *workflowservice.StartBatchOperationRequest_TerminationOperation:
 		identity = op.TerminationOperation.GetIdentity()
@@ -3743,6 +3798,8 @@ func (wh *WorkflowHandler) StartBatchOperation(
 	case *workflowservice.StartBatchOperationRequest_ResetOperation:
 		identity = op.ResetOperation.GetIdentity()
 		operationType = batcher.BatchTypeReset
+		resetParams.ResetType = op.ResetOperation.GetResetType()
+		resetParams.ResetReapplyType = op.ResetOperation.GetResetReapplyType()
 	default:
 		return nil, serviceerror.NewInvalidArgument(fmt.Sprintf("The operation type %T is not supported", op))
 	}
@@ -3757,7 +3814,7 @@ func (wh *WorkflowHandler) StartBatchOperation(
 		CancelParams:    batcher.CancelParams{},
 		SignalParams:    signalParams,
 		DeleteParams:    batcher.DeleteParams{},
-		ResetParams:     batcher.ResetParams{},
+		ResetParams:     resetParams,
 	}
 	inputPayload, err := sdk.PreferProtoDataConverter.ToPayloads(input)
 	if err != nil {
@@ -4098,7 +4155,12 @@ func (wh *WorkflowHandler) getHistory(
 		// noop
 	case *serviceerror.DataLoss:
 		// log event
-		wh.logger.Error("encountered data loss event", tag.WorkflowNamespaceID(namespaceID.String()), tag.WorkflowID(execution.GetWorkflowId()), tag.WorkflowRunID(execution.GetRunId()))
+		wh.logger.Error("encountered data loss event",
+			tag.WorkflowNamespaceID(namespaceID.String()),
+			tag.WorkflowID(execution.GetWorkflowId()),
+			tag.WorkflowRunID(execution.GetRunId()),
+			tag.Error(err),
+		)
 		return nil, nil, err
 	default:
 		return nil, nil, err
@@ -4277,8 +4339,8 @@ type buildIdAndFlag interface {
 	GetUseVersioning() bool
 }
 
-func (wh *WorkflowHandler) validateVersioningInfo(namespace string, id buildIdAndFlag, tq *taskqueuepb.TaskQueue) error {
-	if id.GetUseVersioning() && !wh.config.EnableWorkerVersioningWorkflow(namespace) {
+func (wh *WorkflowHandler) validateVersioningInfo(nsName string, id buildIdAndFlag, tq *taskqueuepb.TaskQueue) error {
+	if id.GetUseVersioning() && !wh.config.EnableWorkerVersioningWorkflow(nsName) {
 		return errWorkerVersioningNotAllowed
 	}
 	if id.GetUseVersioning() && tq.GetKind() == enumspb.TASK_QUEUE_KIND_STICKY && len(tq.GetNormalName()) == 0 {
@@ -4842,9 +4904,10 @@ func (wh *WorkflowHandler) cleanScheduleSearchAttributes(searchAttributes *commo
 
 	delete(fields, searchattribute.TemporalSchedulePaused)
 	delete(fields, "TemporalScheduleInfoJSON") // used by older version, clean this up if present
-	// this isn't schedule-related but isn't relevant to the user for
+	// these aren't schedule-related but they aren't relevant to the user for
 	// scheduler workflows since it's the server worker
 	delete(fields, searchattribute.BinaryChecksums)
+	delete(fields, searchattribute.BuildIds)
 
 	if len(fields) == 0 {
 		return nil

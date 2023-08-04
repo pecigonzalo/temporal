@@ -814,13 +814,18 @@ func (c *ContextImpl) UpdateRegistry(ctx context.Context) update.Registry {
 	if c.updateRegistry == nil {
 		nsIDStr := c.MutableState.GetNamespaceEntry().ID().String()
 		c.updateRegistry = update.NewRegistry(
-			c.MutableState,
+			func() update.UpdateStore { return c.MutableState },
 			update.WithLogger(c.logger),
 			update.WithMetrics(c.metricsHandler),
 			update.WithTracerProvider(trace.SpanFromContext(ctx).TracerProvider()),
 			update.WithInFlightLimit(
 				func() int {
 					return c.config.WorkflowExecutionMaxInFlightUpdates(nsIDStr)
+				},
+			),
+			update.WithTotalLimit(
+				func() int {
+					return c.config.WorkflowExecutionMaxTotalUpdates(nsIDStr)
 				},
 			),
 		)

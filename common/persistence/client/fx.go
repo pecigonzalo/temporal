@@ -45,22 +45,29 @@ type (
 	PersistenceNamespaceMaxQps         dynamicconfig.IntPropertyFnWithNamespaceFilter
 	PersistencePerShardNamespaceMaxQPS dynamicconfig.IntPropertyFnWithNamespaceFilter
 	EnablePriorityRateLimiting         dynamicconfig.BoolPropertyFn
-	ClusterName                        string
+	OperatorRPSRatio                   dynamicconfig.FloatPropertyFn
+
+	DynamicRateLimitingParams dynamicconfig.MapPropertyFn
+
+	ClusterName string
 
 	NewFactoryParams struct {
 		fx.In
 
 		DataStoreFactory                   DataStoreFactory
+		EventBlobCache                     persistence.XDCCache
 		Cfg                                *config.Persistence
 		PersistenceMaxQPS                  PersistenceMaxQps
 		PersistenceNamespaceMaxQPS         PersistenceNamespaceMaxQps
 		PersistencePerShardNamespaceMaxQPS PersistencePerShardNamespaceMaxQPS
 		EnablePriorityRateLimiting         EnablePriorityRateLimiting
+		OperatorRPSRatio                   OperatorRPSRatio
 		ClusterName                        ClusterName
 		ServiceName                        primitives.ServiceName
 		MetricsHandler                     metrics.Handler
 		Logger                             log.Logger
 		HealthSignals                      persistence.HealthSignalAggregator
+		DynamicRateLimitingParams          DynamicRateLimitingParams
 	}
 
 	FactoryProviderFn func(NewFactoryParams) Factory
@@ -71,10 +78,20 @@ var Module = fx.Options(
 	fx.Provide(ClusterNameProvider),
 	fx.Provide(DataStoreFactoryProvider),
 	fx.Provide(HealthSignalAggregatorProvider),
+	fx.Provide(EventBlobCacheProvider),
 )
 
 func ClusterNameProvider(config *cluster.Config) ClusterName {
 	return ClusterName(config.CurrentClusterName)
+}
+
+func EventBlobCacheProvider(
+	dc *dynamicconfig.Collection,
+) persistence.XDCCache {
+	return persistence.NewEventsBlobCache(
+		dc.GetIntProperty(dynamicconfig.XDCCacheMaxSizeBytes, 8*1024*1024)(),
+		20*time.Second,
+	)
 }
 
 func FactoryProvider(
@@ -88,6 +105,10 @@ func FactoryProvider(
 				params.PersistenceMaxQPS,
 				params.PersistencePerShardNamespaceMaxQPS,
 				RequestPriorityFn,
+				params.OperatorRPSRatio,
+				params.HealthSignals,
+				params.DynamicRateLimitingParams,
+				params.Logger,
 			)
 		} else {
 			requestRatelimiter = NewNoopPriorityRateLimiter(params.PersistenceMaxQPS)
@@ -99,6 +120,7 @@ func FactoryProvider(
 		params.Cfg,
 		requestRatelimiter,
 		serialization.NewSerializer(),
+		params.EventBlobCache,
 		string(params.ClusterName),
 		params.MetricsHandler,
 		params.Logger,
@@ -109,14 +131,16 @@ func FactoryProvider(
 func HealthSignalAggregatorProvider(
 	dynamicCollection *dynamicconfig.Collection,
 	metricsHandler metrics.Handler,
-	logger log.Logger,
+	logger log.ThrottledLogger,
 ) persistence.HealthSignalAggregator {
-	if dynamicCollection.GetBoolProperty(dynamicconfig.PersistenceHealthSignalCollectionEnabled, true)() {
+	if dynamicCollection.GetBoolProperty(dynamicconfig.PersistenceHealthSignalMetricsEnabled, true)() {
 		return persistence.NewHealthSignalAggregatorImpl(
-			dynamicCollection.GetDurationProperty(dynamicconfig.PersistenceHealthSignalWindowSize, 3*time.Second)(),
-			dynamicCollection.GetIntProperty(dynamicconfig.PersistenceHealthSignalBufferSize, 500)(),
+			dynamicCollection.GetBoolProperty(dynamicconfig.PersistenceHealthSignalAggregationEnabled, true)(),
+			dynamicCollection.GetDurationProperty(dynamicconfig.PersistenceHealthSignalWindowSize, 10*time.Second)(),
+			dynamicCollection.GetIntProperty(dynamicconfig.PersistenceHealthSignalBufferSize, 5000)(),
 			metricsHandler,
 			dynamicCollection.GetIntProperty(dynamicconfig.ShardRPSWarnLimit, 50),
+			dynamicCollection.GetFloat64Property(dynamicconfig.ShardPerNsRPSWarnPercent, 0.8),
 			logger,
 		)
 	}

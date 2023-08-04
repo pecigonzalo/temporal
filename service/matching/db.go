@@ -26,7 +26,6 @@ package matching
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"sync"
 	"time"
@@ -36,6 +35,7 @@ import (
 
 	"go.temporal.io/server/api/matchingservice/v1"
 	persistencespb "go.temporal.io/server/api/persistence/v1"
+	"go.temporal.io/server/common"
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 	"go.temporal.io/server/common/namespace"
@@ -46,6 +46,17 @@ import (
 const (
 	initialRangeID     = 1 // Id of the first range of a new task queue
 	stickyTaskQueueTTL = 24 * time.Hour
+
+	// userDataEnabled is the default state: user data is enabled.
+	userDataEnabled userDataState = iota
+	// userDataDisabled means user data is disabled due to the LoadUserData dynamic config
+	// being turned off on this node or the parent node. This should cause GetUserData to
+	// return a FailedPrecondition error.
+	userDataDisabled
+	// userDataSpecificVersion means this tqm/db is for a specific version set, which doesn't
+	// have its own user data and it should not be used. This should cause GetUserData to
+	// return an Internal error (access would indicate a bug).
+	userDataSpecificVersion
 )
 
 type (
@@ -58,6 +69,7 @@ type (
 		ackLevel        int64
 		userData        *persistencespb.VersionedTaskQueueUserData
 		userDataChanged chan struct{}
+		userDataState   userDataState
 		store           persistence.TaskManager
 		logger          log.Logger
 		matchingClient  matchingservice.MatchingServiceClient
@@ -66,6 +78,8 @@ type (
 		rangeID  int64
 		ackLevel int64
 	}
+
+	userDataState int
 )
 
 var (
@@ -74,6 +88,8 @@ var (
 	// This is an internal error when requesting user data on a TQM created for a specific
 	// version set. This indicates a bug in the server since nothing should be using this data.
 	errNoUserDataOnVersionedTQM = serviceerror.NewInternal("should not get user data on versioned tqm")
+
+	errUserDataDisabled = serviceerror.NewFailedPrecondition("Task queue user data operations are disabled")
 )
 
 // newTaskQueueDB returns an instance of an object that represents
@@ -145,18 +161,16 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
 		response.TaskQueueInfo.Kind = db.taskQueueKind
 		response.TaskQueueInfo.ExpiryTime = db.expiryTime()
 		response.TaskQueueInfo.LastUpdateTime = timestamp.TimeNowPtrUtc()
-		_, err := db.store.UpdateTaskQueue(ctx, &persistence.UpdateTaskQueueRequest{
+		if _, err := db.store.UpdateTaskQueue(ctx, &persistence.UpdateTaskQueueRequest{
 			RangeID:       response.RangeID + 1,
 			TaskQueueInfo: response.TaskQueueInfo,
 			PrevRangeID:   response.RangeID,
-		})
-		if err != nil {
+		}); err != nil {
 			return err
 		}
 		db.ackLevel = response.TaskQueueInfo.AckLevel
 		db.rangeID = response.RangeID + 1
-		_, _, err = db.getUserDataLocked(ctx)
-		return err
+		return nil
 
 	case *serviceerror.NotFound:
 		if _, err := db.store.CreateTaskQueue(ctx, &persistence.CreateTaskQueueRequest{
@@ -166,8 +180,7 @@ func (db *taskQueueDB) takeOverTaskQueueLocked(
 			return err
 		}
 		db.rangeID = initialRangeID
-		_, _, err = db.getUserDataLocked(ctx)
-		return err
+		return nil
 
 	default:
 		return err
@@ -297,20 +310,32 @@ func (db *taskQueueDB) CompleteTasksLessThan(
 	return n, err
 }
 
-// Returns true if we are storing user data in the db. We need to be the root partition,
-// workflow type, unversioned, and also a normal queue.
+// DbStoresUserData returns true if we are storing user data in the db. We need to be the root partition, workflow type,
+// unversioned, and also a normal queue.
 func (db *taskQueueDB) DbStoresUserData() bool {
 	return db.taskQueue.OwnsUserData() && db.taskQueueKind == enumspb.TASK_QUEUE_KIND_NORMAL
 }
 
 // GetUserData returns the versioning data for this task queue. Do not mutate the returned pointer, as doing so
 // will cause cache inconsistency.
-func (db *taskQueueDB) GetUserData(
-	ctx context.Context,
-) (*persistencespb.VersionedTaskQueueUserData, chan struct{}, error) {
+func (db *taskQueueDB) GetUserData() (*persistencespb.VersionedTaskQueueUserData, chan struct{}, error) {
 	db.Lock()
 	defer db.Unlock()
-	return db.getUserDataLocked(ctx)
+	return db.getUserDataLocked()
+}
+
+func (db *taskQueueDB) getUserDataLocked() (*persistencespb.VersionedTaskQueueUserData, chan struct{}, error) {
+	switch db.userDataState {
+	case userDataEnabled:
+		return db.userData, db.userDataChanged, nil
+	case userDataDisabled:
+		return nil, nil, errUserDataDisabled
+	case userDataSpecificVersion:
+		return nil, nil, errNoUserDataOnVersionedTQM
+	default:
+		// shouldn't happen
+		return nil, nil, serviceerror.NewInternal("unexpected user data enabled state")
+	}
 }
 
 func (db *taskQueueDB) setUserDataLocked(userData *persistencespb.VersionedTaskQueueUserData) {
@@ -319,32 +344,35 @@ func (db *taskQueueDB) setUserDataLocked(userData *persistencespb.VersionedTaskQ
 	db.userDataChanged = make(chan struct{})
 }
 
-// db.Lock() must be held before calling.
-// Returns in-memory cached value or reads from DB and updates the cached value.
-// Note: can return nil value with no error.
-func (db *taskQueueDB) getUserDataLocked(
-	ctx context.Context,
-) (*persistencespb.VersionedTaskQueueUserData, chan struct{}, error) {
-	if db.userData == nil {
-		if !db.DbStoresUserData() {
-			return nil, db.userDataChanged, nil
-		}
-
-		response, err := db.store.GetTaskQueueUserData(ctx, &persistence.GetTaskQueueUserDataRequest{
-			NamespaceID: db.namespaceID.String(),
-			TaskQueue:   db.taskQueue.BaseNameString(),
-		})
-		if err != nil {
-			var notFoundError *serviceerror.NotFound
-			if errors.As(err, &notFoundError) {
-				return nil, db.userDataChanged, nil
-			}
-			return nil, nil, err
-		}
-		db.setUserDataLocked(response.UserData)
+// Loads user data from db (called only on initialization of taskQueueManager).
+func (db *taskQueueDB) loadUserData(ctx context.Context) error {
+	if !db.DbStoresUserData() {
+		return nil
 	}
 
-	return db.userData, db.userDataChanged, nil
+	response, err := db.store.GetTaskQueueUserData(ctx, &persistence.GetTaskQueueUserDataRequest{
+		NamespaceID: db.namespaceID.String(),
+		TaskQueue:   db.taskQueue.BaseNameString(),
+	})
+	if common.IsNotFoundError(err) {
+		// not all task queues have user data
+		response, err = &persistence.GetTaskQueueUserDataResponse{}, nil
+	}
+	if err != nil {
+		return err
+	}
+
+	db.Lock()
+	defer db.Unlock()
+	db.setUserDataLocked(response.UserData)
+
+	return nil
+}
+
+func (db *taskQueueDB) setUserDataState(setUserDataState userDataState) {
+	db.Lock()
+	defer db.Unlock()
+	db.userDataState = setUserDataState
 }
 
 // UpdateUserData allows callers to update user data (such as worker build IDs) for this task queue. The pointer passed
@@ -352,28 +380,41 @@ func (db *taskQueueDB) getUserDataLocked(
 // Note that the user data's clock may be nil and should be initialized externally where there's access to the cluster
 // metadata and the cluster ID can be obtained.
 //
+// If knownVersion is non 0 and not equal to the current version, the update will fail.
+//
 // The DB write is performed remotely on an owning node for all user data updates in the namespace.
 //
-// On success returns a pointer to the updated data, which must *not* be mutated.
-func (db *taskQueueDB) UpdateUserData(ctx context.Context, updateFn func(*persistencespb.TaskQueueUserData) (*persistencespb.TaskQueueUserData, error), taskQueueLimitPerBuildId int) (*persistencespb.VersionedTaskQueueUserData, error) {
+// On success returns a pointer to the updated data, which must *not* be mutated, and a boolean indicating whether the
+// data should be replicated.
+func (db *taskQueueDB) UpdateUserData(
+	ctx context.Context,
+	updateFn UserDataUpdateFunc,
+	knownVersion int64,
+	taskQueueLimitPerBuildId int,
+) (*persistencespb.VersionedTaskQueueUserData, bool, error) {
 	if !db.DbStoresUserData() {
-		return nil, errUserDataNoMutateNonRoot
+		return nil, false, errUserDataNoMutateNonRoot
 	}
+
 	db.Lock()
 	defer db.Unlock()
 
-	userData, _, err := db.getUserDataLocked(ctx)
+	userData, _, err := db.getUserDataLocked()
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 
 	preUpdateData := userData.GetData()
+	preUpdateVersion := userData.GetVersion()
 	if preUpdateData == nil {
 		preUpdateData = &persistencespb.TaskQueueUserData{}
 	}
-	updatedUserData, err := updateFn(preUpdateData)
+	if knownVersion > 0 && preUpdateVersion != knownVersion {
+		return nil, false, serviceerror.NewFailedPrecondition(fmt.Sprintf("user data version mismatch: requested: %d, current: %d", knownVersion, preUpdateVersion))
+	}
+	updatedUserData, shouldReplicate, err := updateFn(preUpdateData)
 	if err != nil {
-		return nil, err
+		return nil, false, err
 	}
 	added, removed := GetBuildIdDeltas(preUpdateData.GetVersioningData(), updatedUserData.GetVersioningData())
 	if taskQueueLimitPerBuildId > 0 && len(added) > 0 {
@@ -385,10 +426,10 @@ func (db *taskQueueDB) UpdateUserData(ctx context.Context, updateFn func(*persis
 				BuildID:     buildId,
 			})
 			if err != nil {
-				return nil, err
+				return nil, false, err
 			}
 			if numTaskQueues >= taskQueueLimitPerBuildId {
-				return nil, serviceerror.NewFailedPrecondition(fmt.Sprintf("Exceeded max task queues allowed to be mapped to a single build id: %d", taskQueueLimitPerBuildId))
+				return nil, false, serviceerror.NewFailedPrecondition(fmt.Sprintf("Exceeded max task queues allowed to be mapped to a single build id: %d", taskQueueLimitPerBuildId))
 			}
 		}
 	}
@@ -396,14 +437,16 @@ func (db *taskQueueDB) UpdateUserData(ctx context.Context, updateFn func(*persis
 	_, err = db.matchingClient.UpdateTaskQueueUserData(ctx, &matchingservice.UpdateTaskQueueUserDataRequest{
 		NamespaceId:     db.namespaceID.String(),
 		TaskQueue:       db.cachedQueueInfo().Name,
-		UserData:        &persistencespb.VersionedTaskQueueUserData{Version: userData.GetVersion(), Data: updatedUserData},
+		UserData:        &persistencespb.VersionedTaskQueueUserData{Version: preUpdateVersion, Data: updatedUserData},
 		BuildIdsAdded:   added,
 		BuildIdsRemoved: removed,
 	})
+	var updatedVersionedData *persistencespb.VersionedTaskQueueUserData
 	if err == nil {
-		db.setUserDataLocked(&persistencespb.VersionedTaskQueueUserData{Version: userData.GetVersion() + 1, Data: updatedUserData})
+		updatedVersionedData = &persistencespb.VersionedTaskQueueUserData{Version: preUpdateVersion + 1, Data: updatedUserData}
+		db.setUserDataLocked(updatedVersionedData)
 	}
-	return db.userData, err
+	return updatedVersionedData, shouldReplicate, err
 }
 
 func (db *taskQueueDB) setUserDataForNonOwningPartition(userData *persistencespb.VersionedTaskQueueUserData) {

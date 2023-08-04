@@ -26,97 +26,120 @@ package metrics
 
 import (
 	"context"
+	"fmt"
 	"time"
 
 	"go.opentelemetry.io/otel/attribute"
 	"go.opentelemetry.io/otel/metric"
-	"go.opentelemetry.io/otel/metric/instrument"
-	otelunit "go.opentelemetry.io/otel/metric/unit"
 
 	"go.temporal.io/server/common/log"
 	"go.temporal.io/server/common/log/tag"
 )
 
-// MetricsHandler is an event.Handler for OpenTelemetry metrics.
-// Its Event method handles Metric events and ignores all others.
+// otelMetricsHandler is an adapter around an OpenTelemetry [metric.Meter] that implements the [Handler] interface.
 type otelMetricsHandler struct {
 	l           log.Logger
 	tags        []Tag
 	provider    OpenTelemetryProvider
 	excludeTags excludeTags
+	catalog     catalog
 }
 
 var _ Handler = (*otelMetricsHandler)(nil)
 
-func NewOtelMetricsHandler(l log.Logger, o OpenTelemetryProvider, cfg ClientConfig) *otelMetricsHandler {
+// NewOtelMetricsHandler returns a new Handler that uses the provided OpenTelemetry [metric.Meter] to record metrics.
+// This OTel handler supports metric descriptions for metrics registered with the New*Def functions. However, those
+// functions must be called before this constructor. Otherwise, the descriptions will be empty. This is because the
+// OTel metric descriptions are generated from the globalRegistry. You may also record metrics that are not registered
+// via the New*Def functions. In that case, the metric description will be the OTel default (the metric name itself).
+func NewOtelMetricsHandler(
+	l log.Logger,
+	o OpenTelemetryProvider,
+	cfg ClientConfig,
+) (*otelMetricsHandler, error) {
+	c, err := globalRegistry.buildCatalog()
+	if err != nil {
+		return nil, fmt.Errorf("failed to build metrics catalog: %w", err)
+	}
 	return &otelMetricsHandler{
 		l:           l,
 		provider:    o,
 		excludeTags: configExcludeTags(cfg),
-	}
+		catalog:     c,
+	}, nil
 }
 
-// WithTags creates a new MetricProvder with provided []Tag
-// Tags are merged with registered Tags from the source MetricsHandler
+// WithTags creates a new Handler with the provided Tag list.
+// Tags are merged with the existing tags.
 func (omp *otelMetricsHandler) WithTags(tags ...Tag) Handler {
-	return &otelMetricsHandler{
-		provider:    omp.provider,
-		excludeTags: omp.excludeTags,
-		tags:        append(omp.tags, tags...),
-	}
+	newHandler := *omp
+	newHandler.tags = append(newHandler.tags, tags...)
+	return &newHandler
 }
 
-// Counter obtains a counter for the given name and MetricOptions.
+// Counter obtains a counter for the given name.
 func (omp *otelMetricsHandler) Counter(counter string) CounterIface {
-	c, err := omp.provider.GetMeter().Int64Counter(counter)
+	opts := addOptions(omp, counterOptions{}, counter)
+	c, err := omp.provider.GetMeter().Int64Counter(counter, opts...)
 	if err != nil {
-		omp.l.Fatal("error getting metric", tag.NewStringTag("MetricName", counter), tag.Error(err))
+		omp.l.Error("error getting metric", tag.NewStringTag("MetricName", counter), tag.Error(err))
+		return CounterFunc(func(i int64, t ...Tag) {})
 	}
 
 	return CounterFunc(func(i int64, t ...Tag) {
-		c.Add(context.Background(), i, tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+		option := metric.WithAttributes(tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+		c.Add(context.Background(), i, option)
 	})
 }
 
-// Gauge obtains a gauge for the given name and MetricOptions.
+// Gauge obtains a gauge for the given name.
 func (omp *otelMetricsHandler) Gauge(gauge string) GaugeIface {
-	c, err := omp.provider.GetMeter().Float64ObservableGauge(gauge)
+	opts := addOptions(omp, gaugeOptions{}, gauge)
+	c, err := omp.provider.GetMeter().Float64ObservableGauge(gauge, opts...)
 	if err != nil {
-		omp.l.Fatal("error getting metric", tag.NewStringTag("MetricName", gauge), tag.Error(err))
+		omp.l.Error("error getting metric", tag.NewStringTag("MetricName", gauge), tag.Error(err))
+		return GaugeFunc(func(i float64, t ...Tag) {})
 	}
 
 	return GaugeFunc(func(i float64, t ...Tag) {
 		_, err = omp.provider.GetMeter().RegisterCallback(func(ctx context.Context, o metric.Observer) error {
-			o.ObserveFloat64(c, i, tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+			option := metric.WithAttributes(tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+			o.ObserveFloat64(c, i, option)
 			return nil
 		}, c)
 		if err != nil {
-			omp.l.Fatal("error setting callback metric update", tag.NewStringTag("MetricName", gauge), tag.Error(err))
+			omp.l.Error("error setting callback metric update", tag.NewStringTag("MetricName", gauge), tag.Error(err))
 		}
 	})
 }
 
-// Timer obtains a timer for the given name and MetricOptions.
+// Timer obtains a timer for the given name.
 func (omp *otelMetricsHandler) Timer(timer string) TimerIface {
-	c, err := omp.provider.GetMeter().Int64Histogram(timer, instrument.WithUnit(otelunit.Unit(Milliseconds)))
+	opts := addOptions(omp, histogramOptions{metric.WithUnit(Milliseconds)}, timer)
+	c, err := omp.provider.GetMeter().Int64Histogram(timer, opts...)
 	if err != nil {
-		omp.l.Fatal("error getting metric", tag.NewStringTag("MetricName", timer), tag.Error(err))
+		omp.l.Error("error getting metric", tag.NewStringTag("MetricName", timer), tag.Error(err))
+		return TimerFunc(func(i time.Duration, t ...Tag) {})
 	}
 
 	return TimerFunc(func(i time.Duration, t ...Tag) {
-		c.Record(context.Background(), i.Milliseconds(), tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+		option := metric.WithAttributes(tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+		c.Record(context.Background(), i.Milliseconds(), option)
 	})
 }
 
-// Histogram obtains a histogram for the given name and MetricOptions.
+// Histogram obtains a histogram for the given name.
 func (omp *otelMetricsHandler) Histogram(histogram string, unit MetricUnit) HistogramIface {
-	c, err := omp.provider.GetMeter().Int64Histogram(histogram, instrument.WithUnit(otelunit.Unit(unit)))
+	opts := addOptions(omp, histogramOptions{metric.WithUnit(string(unit))}, histogram)
+	c, err := omp.provider.GetMeter().Int64Histogram(histogram, opts...)
 	if err != nil {
-		omp.l.Fatal("error getting metric", tag.NewStringTag("MetricName", histogram), tag.Error(err))
+		omp.l.Error("error getting metric", tag.NewStringTag("MetricName", histogram), tag.Error(err))
+		return HistogramFunc(func(i int64, t ...Tag) {})
 	}
 
-	return CounterFunc(func(i int64, t ...Tag) {
-		c.Record(context.Background(), i, tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+	return HistogramFunc(func(i int64, t ...Tag) {
+		option := metric.WithAttributes(tagsToAttributes(omp.tags, t, omp.excludeTags)...)
+		c.Record(context.Background(), i, option)
 	})
 }
 

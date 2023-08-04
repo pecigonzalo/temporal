@@ -141,9 +141,9 @@ type MatchingServiceClient interface {
 	// ListTaskQueuePartitions returns a map of partitionKey and hostAddress for a task queue.
 	ListTaskQueuePartitions(ctx context.Context, in *ListTaskQueuePartitionsRequest, opts ...grpc.CallOption) (*ListTaskQueuePartitionsResponse, error)
 	// (-- api-linter: core::0134::response-message-name=disabled
-	//     aip.dev/not-precedent: UpdateWorkerBuildIdOrdering RPC doesn't follow Google API format. --)
+	//     aip.dev/not-precedent: UpdateWorkerBuildIdCompatibility RPC doesn't follow Google API format. --)
 	// (-- api-linter: core::0134::method-signature=disabled
-	//     aip.dev/not-precedent: UpdateWorkerBuildIdOrdering RPC doesn't follow Google API format. --)
+	//     aip.dev/not-precedent: UpdateWorkerBuildIdCompatibility RPC doesn't follow Google API format. --)
 	UpdateWorkerBuildIdCompatibility(ctx context.Context, in *UpdateWorkerBuildIdCompatibilityRequest, opts ...grpc.CallOption) (*UpdateWorkerBuildIdCompatibilityResponse, error)
 	GetWorkerBuildIdCompatibility(ctx context.Context, in *GetWorkerBuildIdCompatibilityRequest, opts ...grpc.CallOption) (*GetWorkerBuildIdCompatibilityResponse, error)
 	// Fetch user data for a task queue, this request should always be routed to the node holding the root partition of the workflow task queue.
@@ -155,6 +155,8 @@ type MatchingServiceClient interface {
 	// Force unloading a task queue. Used for testing only.
 	ForceUnloadTaskQueue(ctx context.Context, in *ForceUnloadTaskQueueRequest, opts ...grpc.CallOption) (*ForceUnloadTaskQueueResponse, error)
 	// Update task queue user data in owning node for all updates in namespace.
+	// All user data updates must first go through the task queue owner using the `UpdateWorkerBuildIdCompatibility`
+	// API.
 	// (-- api-linter: core::0134::response-message-name=disabled
 	//     aip.dev/not-precedent: UpdateTaskQueueUserData RPC doesn't follow Google API format. --)
 	// (-- api-linter: core::0134::method-signature=disabled
@@ -357,9 +359,9 @@ type MatchingServiceServer interface {
 	// ListTaskQueuePartitions returns a map of partitionKey and hostAddress for a task queue.
 	ListTaskQueuePartitions(context.Context, *ListTaskQueuePartitionsRequest) (*ListTaskQueuePartitionsResponse, error)
 	// (-- api-linter: core::0134::response-message-name=disabled
-	//     aip.dev/not-precedent: UpdateWorkerBuildIdOrdering RPC doesn't follow Google API format. --)
+	//     aip.dev/not-precedent: UpdateWorkerBuildIdCompatibility RPC doesn't follow Google API format. --)
 	// (-- api-linter: core::0134::method-signature=disabled
-	//     aip.dev/not-precedent: UpdateWorkerBuildIdOrdering RPC doesn't follow Google API format. --)
+	//     aip.dev/not-precedent: UpdateWorkerBuildIdCompatibility RPC doesn't follow Google API format. --)
 	UpdateWorkerBuildIdCompatibility(context.Context, *UpdateWorkerBuildIdCompatibilityRequest) (*UpdateWorkerBuildIdCompatibilityResponse, error)
 	GetWorkerBuildIdCompatibility(context.Context, *GetWorkerBuildIdCompatibilityRequest) (*GetWorkerBuildIdCompatibilityResponse, error)
 	// Fetch user data for a task queue, this request should always be routed to the node holding the root partition of the workflow task queue.
@@ -371,6 +373,8 @@ type MatchingServiceServer interface {
 	// Force unloading a task queue. Used for testing only.
 	ForceUnloadTaskQueue(context.Context, *ForceUnloadTaskQueueRequest) (*ForceUnloadTaskQueueResponse, error)
 	// Update task queue user data in owning node for all updates in namespace.
+	// All user data updates must first go through the task queue owner using the `UpdateWorkerBuildIdCompatibility`
+	// API.
 	// (-- api-linter: core::0134::response-message-name=disabled
 	//     aip.dev/not-precedent: UpdateTaskQueueUserData RPC doesn't follow Google API format. --)
 	// (-- api-linter: core::0134::method-signature=disabled

@@ -132,3 +132,23 @@ func MapConcurrent[IN any, OUT any](input []IN, mapper func(IN) (OUT, error)) ([
 	}
 	return results, nil
 }
+
+// FilterSlice iterates over elements of a slice, returning a new slice of all elements predicate returns true for.
+func FilterSlice[T any](in []T, predicate func(T) bool) []T {
+	var out []T
+	for _, elem := range in {
+		if predicate(elem) {
+			out = append(out, elem)
+		}
+	}
+	return out
+}
+
+// ReduceSlice reduces a slice using given reducer function and initial value.
+func ReduceSlice[T any, A any](in []T, initializer A, reducer func(A, T) A) A {
+	acc := initializer
+	for _, val := range in {
+		acc = reducer(acc, val)
+	}
+	return acc
+}
